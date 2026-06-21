@@ -1726,10 +1726,46 @@ class GatewaySlashCommandsMixin:
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
-            state = mgr.resume()
+            was_active = False
+            try:
+                was_active = bool(mgr.is_active())
+            except Exception:
+                was_active = False
+            # If the goal is already active, users commonly use /goal resume as
+            # a "kick the loop" control after a restart or lost continuation.
+            # Do not reset the monotonic counter in that case; only paused or
+            # exhausted goals get a fresh budget window.
+            state = mgr.resume(reset_budget=not was_active)
             if state is None:
                 return t("gateway.goal.no_resume")
-            return t("gateway.goal.resumed", goal=state.goal)
+
+            queued = False
+            adapters = getattr(self, "adapters", {}) or {}
+            adapter = adapters.get(event.source.platform) if event.source else None
+            session_key_fn = getattr(self, "_session_key_for_source", None)
+            _quick_key = session_key_fn(event.source) if event.source and session_key_fn else None
+            if adapter and _quick_key:
+                try:
+                    continuation = mgr.next_continuation_prompt()
+                    cont_event = MessageEvent(
+                        text=continuation,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=None,
+                        channel_prompt=event.channel_prompt,
+                    )
+                    enqueue_once = getattr(self, "_enqueue_goal_continuation_once", None)
+                    if enqueue_once is not None:
+                        queued = bool(enqueue_once(_quick_key, cont_event, adapter))
+                    else:
+                        enqueue_fifo = getattr(self, "_enqueue_fifo")
+                        enqueue_fifo(_quick_key, cont_event, adapter)
+                        queued = True
+                except Exception as exc:
+                    logger.debug("goal resume: continuation enqueue failed: %s", exc)
+
+            suffix = "\nQueued the next goal step." if queued else "\nGoal is active; send any message to kick the next turn."
+            return f"{t('gateway.goal.resumed', goal=state.goal)}{suffix}"
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()

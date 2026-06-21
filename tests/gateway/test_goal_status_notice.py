@@ -110,6 +110,65 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
     ]
 
 
+@pytest.mark.asyncio
+async def test_goal_resume_queues_next_step_without_resetting_active_counter():
+    """Regression: /goal resume should kick a stalled active goal.
+
+    Users reach for /goal resume after restarts, lost continuations, or storage
+    work.  If the goal is already active, resume must not reset the monotonic
+    turn counter, but it should enqueue a synthetic continuation so the loop
+    actually resumes instead of only returning a status line.
+    """
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    queued = []
+
+    class FakeGoalManager:
+        def __init__(self):
+            self.resume_reset_budget = None
+
+        def is_active(self):
+            return True
+
+        def resume(self, *, reset_budget=True):
+            self.resume_reset_budget = reset_budget
+            return SimpleNamespace(goal="finish the task", turns_used=650)
+
+        def next_continuation_prompt(self):
+            return CONTINUATION_PROMPT_TEMPLATE.format(goal="finish the task")
+
+    mgr = FakeGoalManager()
+    runner._get_goal_manager_for_event = lambda event: (mgr, SimpleNamespace(session_id="sid"))
+    runner._session_key_for_source = lambda source: "telegram:-100:30"
+
+    def enqueue_once(session_key, event, adapter):
+        queued.append((session_key, event, adapter))
+        return True
+
+    runner._enqueue_goal_continuation_once = enqueue_once
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003888240479",
+        thread_id="30",
+        user_id="user-1",
+    )
+    event = MessageEvent(
+        text="/goal resume",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    response = await runner._handle_goal_command(event)
+
+    assert mgr.resume_reset_budget is False
+    assert "Queued the next goal step" in response
+    assert len(queued) == 1
+    assert queued[0][0] == "telegram:-100:30"
+    assert queued[0][1].text.startswith("[Continuing toward your standing goal]")
+    assert queued[0][2] is adapter
+
+
 def test_clear_goal_pending_continuations_removes_slot_and_overflow_only():
     """Regression: /goal pause/clear must cancel queued self-continuations.
 

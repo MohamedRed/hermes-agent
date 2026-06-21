@@ -302,9 +302,14 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     exists per logical conversation (avoids the "two active goals"
     hazard of a pure copy).
 
-    Returns True when a goal was migrated, False when there was nothing
-    to migrate or the DB was unavailable. Best-effort and never raises —
-    a failure here must not block compression.
+    If the destination already has the same goal text with a lower/reset
+    counter (observed around compression/restart races), reconcile it rather
+    than preserving a bogus ``0/N`` child row.  Unrelated destination goals are
+    still protected from clobbering.
+
+    Returns True when a goal was migrated/reconciled, False when there was
+    nothing to migrate or the DB was unavailable. Best-effort and never raises
+    — a failure here must not block compression.
     """
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
@@ -312,11 +317,30 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         state = load_goal(old_session_id)
         if state is None or getattr(state, "status", None) == "cleared":
             return False
-        # Don't clobber a goal already set on the child (e.g. a resumed
-        # lineage that re-established its own goal).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
+
+        existing = load_goal(new_session_id)
+        if existing is not None and getattr(existing, "status", None) != "cleared":
+            if (existing.goal or "").strip() != (state.goal or "").strip():
+                # Don't clobber a genuinely different goal already set on the
+                # child (e.g. a resumed lineage that established its own goal).
+                return False
+
+            # Same logical goal: keep the newest descriptive fields while
+            # preserving monotonic progress counters and the parent's budget.
+            if existing.last_turn_at > state.last_turn_at:
+                merged = existing
+                merged.turns_used = max(existing.turns_used, state.turns_used)
+                merged.max_turns = max(existing.max_turns, state.max_turns)
+                if not merged.created_at or (state.created_at and state.created_at < merged.created_at):
+                    merged.created_at = state.created_at
+            else:
+                merged = state
+                merged.turns_used = max(state.turns_used, existing.turns_used)
+                merged.max_turns = max(state.max_turns, existing.max_turns)
+        else:
+            merged = state
+
+        save_goal(new_session_id, merged)
         # Archive the parent's row so it isn't double-counted as active.
         clear_goal(old_session_id)
         logger.debug(
@@ -326,6 +350,7 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return True
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
+        return False
 
 # ──────────────────────────────────────────────────────────────────────
 # Judge

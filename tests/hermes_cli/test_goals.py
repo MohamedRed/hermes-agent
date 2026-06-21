@@ -682,6 +682,47 @@ class TestMigrateGoalToSession:
         assert migrate_goal_to_session("p3", "c3") is False
         assert load_goal("c3").goal == "child already has one"
 
+    def test_reconciles_same_goal_child_with_reset_turn_counter(self, hermes_home):
+        """A stale child row for the same goal must not reset 649/N to 0/N.
+
+        This can happen around compression/restart boundaries when a child
+        session already has a copied/recreated goal row with the same text but
+        a lower counter.  The migration should preserve the monotonic counter
+        while still refusing to clobber unrelated child goals.
+        """
+        from hermes_cli.goals import save_goal, load_goal, migrate_goal_to_session, GoalState
+
+        save_goal(
+            "parent-reset-counter",
+            GoalState(
+                goal="ship the feature",
+                turns_used=649,
+                max_turns=9999,
+                last_turn_at=1000.0,
+                last_verdict="continue",
+                last_reason="parent progress",
+            ),
+        )
+        save_goal(
+            "child-reset-counter",
+            GoalState(
+                goal="ship the feature",
+                turns_used=0,
+                max_turns=9999,
+                last_turn_at=0.0,
+            ),
+        )
+
+        assert migrate_goal_to_session("parent-reset-counter", "child-reset-counter") is True
+        child = load_goal("child-reset-counter")
+        assert child is not None
+        assert child.goal == "ship the feature"
+        assert child.turns_used == 649
+        assert child.last_reason == "parent progress"
+        parent = load_goal("parent-reset-counter")
+        assert parent is not None
+        assert parent.status == "cleared"
+
     def test_same_id_is_noop(self, hermes_home):
         from hermes_cli.goals import save_goal, migrate_goal_to_session, GoalState
         save_goal("same", GoalState(goal="g"))

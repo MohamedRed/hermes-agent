@@ -252,6 +252,50 @@ class TestGoalManager:
         assert mgr2.state.goal == "do the thing"
         assert mgr2.is_active()
 
+    def test_migrate_goal_preserves_unfinished_goal_after_compression_split(self, hermes_home):
+        """Regression guard for #33618: /goal survives session_id rotation."""
+        from hermes_cli.goals import GoalManager, migrate_goal_to_session
+
+        old_sid = "compress-parent-sid"
+        new_sid = "compress-child-sid"
+
+        old_mgr = GoalManager(session_id=old_sid, default_max_turns=99)
+        old_mgr.set("ship the feature")
+        old_mgr.evaluate_after_turn("progress", user_initiated=True)
+        old_mgr.pause(reason="waiting for input")
+
+        assert migrate_goal_to_session(old_sid, new_sid, reason="compression") is True
+
+        new_mgr = GoalManager(session_id=new_sid)
+        assert new_mgr.state is not None
+        assert new_mgr.state.goal == "ship the feature"
+        assert new_mgr.state.status == "paused"
+        assert new_mgr.state.turns_used == 1
+        assert new_mgr.state.max_turns == 99
+        assert new_mgr.state.paused_reason == "waiting for input"
+        assert new_mgr.has_goal()
+        assert GoalManager(session_id=old_sid).state.status == "cleared"
+
+    def test_migrate_goal_noops_for_cleared_or_existing_destination(self, hermes_home):
+        from hermes_cli.goals import GoalManager, clear_goal, migrate_goal_to_session
+
+        cleared_mgr = GoalManager(session_id="cleared-parent")
+        cleared_mgr.set("already cleared")
+        clear_goal("cleared-parent")
+        assert migrate_goal_to_session("cleared-parent", "cleared-child", reason="compression") is False
+        assert GoalManager(session_id="cleared-child").state is None
+
+        source_mgr = GoalManager(session_id="source-parent")
+        source_mgr.set("source goal")
+        dest_mgr = GoalManager(session_id="existing-child")
+        dest_mgr.set("existing goal")
+
+        assert migrate_goal_to_session("source-parent", "existing-child", reason="compression") is False
+        preserved = GoalManager(session_id="existing-child").state
+        assert preserved is not None
+        assert preserved.goal == "existing goal"
+        assert GoalManager(session_id="source-parent").state.goal == "source goal"
+
     def test_evaluate_after_turn_done(self, hermes_home):
         """Judge says done → status=done, no continuation."""
         from hermes_cli import goals
@@ -285,6 +329,69 @@ class TestGoalManager:
         assert "a long goal" in decision["continuation_prompt"]
         assert mgr.state.status == "active"
         assert mgr.state.turns_used == 1
+
+    def test_provider_rate_limit_response_stays_active_and_backs_off(self, hermes_home):
+        """A sanitized provider 429 is infrastructure failure, not goal completion."""
+        from hermes_cli import goals
+        from hermes_cli.goals import (
+            DEFAULT_TRANSIENT_RETRY_BASE_SECONDS,
+            GoalManager,
+        )
+
+        mgr = GoalManager(session_id="eval-rate-limit", default_max_turns=5)
+        mgr.set("ship the backend")
+
+        with patch.object(goals, "judge_goal") as judge_mock:
+            judge_mock.side_effect = AssertionError("rate-limit responses must bypass the judge")
+            decision = mgr.evaluate_after_turn(
+                "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+            )
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert decision["retry_after_seconds"] == DEFAULT_TRANSIENT_RETRY_BASE_SECONDS
+        assert "provider" in decision["message"].lower()
+        state = mgr.state
+        assert state is not None
+        assert state.status == "active"
+        assert state.last_verdict == "continue"
+        assert state.last_reason is not None and "rate limited" in state.last_reason
+        assert state.transient_error_failures == 1
+        assert state.retry_after_until > 0
+
+    def test_provider_transient_backoff_is_exponential_and_resets_on_progress(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import DEFAULT_TRANSIENT_RETRY_BASE_SECONDS, GoalManager
+
+        mgr = GoalManager(session_id="eval-rate-limit-reset", default_max_turns=10)
+        mgr.set("ship the backend")
+
+        with patch.object(goals, "judge_goal") as judge_mock:
+            judge_mock.side_effect = AssertionError("transient failures bypass judge")
+            d1 = mgr.evaluate_after_turn("HTTP 429 Too Many Requests")
+            d2 = mgr.evaluate_after_turn("rate limited after 3 retries")
+
+        assert d1["retry_after_seconds"] == DEFAULT_TRANSIENT_RETRY_BASE_SECONDS
+        assert d2["retry_after_seconds"] == DEFAULT_TRANSIENT_RETRY_BASE_SECONDS * 2
+        state = mgr.state
+        assert state is not None
+        assert state.transient_error_failures == 2
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "made progress", False)):
+            d3 = mgr.evaluate_after_turn("implemented part of it")
+
+        assert d3["should_continue"] is True
+        state = mgr.state
+        assert state is not None
+        assert state.transient_error_failures == 0
+        assert state.retry_after_until == 0.0
+
+    def test_provider_error_text_classifier_is_conservative(self):
+        from hermes_cli.goals import classify_transient_provider_response
+
+        assert classify_transient_provider_response("HTTP 429 Too Many Requests")
+        assert classify_transient_provider_response("The model provider is temporarily overloaded")
+        assert classify_transient_provider_response("normal progress: wrote tests and pushed code") is None
 
     def test_evaluate_after_turn_budget_exhausted(self, hermes_home):
         """When turn budget hits ceiling, auto-pause instead of continuing."""

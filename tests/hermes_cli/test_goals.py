@@ -723,6 +723,60 @@ class TestMigrateGoalToSession:
         assert parent is not None
         assert parent.status == "cleared"
 
+    def test_load_reconciles_existing_same_goal_child_reset_counter(self, hermes_home):
+        """Loading status should self-heal pre-existing reset child rows.
+
+        A fix in the compression migration path does not run for a child row
+        that already exists before the new code is deployed.  /goal status
+        should still reconcile the same-goal compression parent and persist the
+        restored monotonic count.
+        """
+        from hermes_cli.goals import GoalState, save_goal, load_goal
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session(session_id="parent-existing-reset", source="telegram", model="test")
+        db.end_session("parent-existing-reset", "compression")
+        db.create_session(
+            session_id="child-existing-reset",
+            source="telegram",
+            model="test",
+            parent_session_id="parent-existing-reset",
+        )
+        save_goal(
+            "parent-existing-reset",
+            GoalState(
+                goal="ship the feature",
+                turns_used=649,
+                max_turns=9999,
+                last_turn_at=1000.0,
+                last_verdict="continue",
+                last_reason="parent progress",
+            ),
+        )
+        save_goal(
+            "child-existing-reset",
+            GoalState(
+                goal="ship the feature",
+                turns_used=0,
+                max_turns=9999,
+                last_turn_at=1100.0,
+                last_verdict="continue",
+                last_reason="child progress",
+            ),
+        )
+
+        child = load_goal("child-existing-reset")
+
+        assert child is not None
+        assert child.turns_used == 650
+        assert child.last_reason == "child progress"
+        # Re-read from the database to prove /goal status-style loading
+        # repaired the persisted row, not just the in-memory object.
+        reread = load_goal("child-existing-reset")
+        assert reread is not None
+        assert reread.turns_used == 650
+
     def test_same_id_is_noop(self, hermes_home):
         from hermes_cli.goals import save_goal, migrate_goal_to_session, GoalState
         save_goal("same", GoalState(goal="g"))

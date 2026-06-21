@@ -248,13 +248,8 @@ def _get_session_db() -> Optional[Any]:
     return db
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
-    """Load the goal for a session, or None if none exists."""
-    if not session_id:
-        return None
-    db = _get_session_db()
-    if db is None:
-        return None
+def _load_goal_raw(db: Any, session_id: str) -> Optional[GoalState]:
+    """Load a goal row without lineage reconciliation."""
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
@@ -267,6 +262,120 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
         return None
+
+
+def _compression_parent_session_id(db: Any, session_id: str) -> Optional[str]:
+    """Return the compression parent for *session_id*, if the DB can prove one."""
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return None
+
+    def _query() -> Optional[Any]:
+        return conn.execute(
+            """
+            SELECT child.parent_session_id AS parent_session_id,
+                   parent.end_reason AS parent_end_reason
+            FROM sessions child
+            LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+            WHERE child.id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+
+    try:
+        lock = getattr(db, "_lock", None)
+        if lock is not None:
+            with lock:
+                row = _query()
+        else:
+            row = _query()
+    except Exception as exc:
+        logger.debug("GoalManager: session lineage lookup failed for %s: %s", session_id, exc)
+        return None
+
+    if not row:
+        return None
+    parent_id = row["parent_session_id"] if hasattr(row, "keys") else row[0]
+    parent_end_reason = row["parent_end_reason"] if hasattr(row, "keys") else row[1]
+    if not parent_id or parent_end_reason != "compression":
+        return None
+    return str(parent_id)
+
+
+def _same_goal_text(a: GoalState, b: GoalState) -> bool:
+    return (a.goal or "").strip() == (b.goal or "").strip()
+
+
+def _reconcile_goal_from_compression_lineage(
+    db: Any,
+    session_id: str,
+    state: GoalState,
+) -> GoalState:
+    """Self-heal same-goal child rows that predate migration fixes.
+
+    ``migrate_goal_to_session`` handles new compression rotations, but already
+    persisted child rows can still have the same goal text with ``turns_used``
+    reset to 0.  Loading /goal status is a safe place to reconcile monotonic
+    counters from compression parents while leaving unrelated child goals alone.
+    """
+    if state.status == "cleared":
+        return state
+
+    original_turns = state.turns_used
+    original_max = state.max_turns
+    parent_id = _compression_parent_session_id(db, session_id)
+    hops = 0
+    while parent_id and hops < 100:
+        hops += 1
+        parent_state = _load_goal_raw(db, parent_id)
+        if (
+            parent_state is not None
+            and parent_state.status != "cleared"
+            and _same_goal_text(state, parent_state)
+        ):
+            # If the child already has a post-turn verdict newer than the
+            # parent, count that child turn on top of the parent's monotonic
+            # total.  Otherwise just preserve the parent's total.
+            child_turn_delta = 1 if (
+                state.last_verdict
+                and state.last_turn_at
+                and parent_state.last_turn_at
+                and state.last_turn_at > parent_state.last_turn_at
+            ) else 0
+            state.turns_used = max(
+                state.turns_used,
+                parent_state.turns_used + child_turn_delta,
+            )
+            state.max_turns = max(state.max_turns, parent_state.max_turns)
+        parent_id = _compression_parent_session_id(db, parent_id)
+
+    if state.turns_used != original_turns or state.max_turns != original_max:
+        try:
+            db.set_meta(_meta_key(session_id), state.to_json())
+            logger.info(
+                "GoalManager: reconciled goal counter for %s (%s/%s -> %s/%s)",
+                session_id,
+                original_turns,
+                original_max,
+                state.turns_used,
+                state.max_turns,
+            )
+        except Exception as exc:
+            logger.debug("GoalManager: goal lineage reconciliation save failed: %s", exc)
+    return state
+
+
+def load_goal(session_id: str) -> Optional[GoalState]:
+    """Load the goal for a session, or None if none exists."""
+    if not session_id:
+        return None
+    db = _get_session_db()
+    if db is None:
+        return None
+    state = _load_goal_raw(db, session_id)
+    if state is None:
+        return None
+    return _reconcile_goal_from_compression_lineage(db, session_id, state)
 
 
 def save_goal(session_id: str, state: GoalState) -> None:
